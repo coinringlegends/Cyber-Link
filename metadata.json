@@ -1,0 +1,6 @@
+{
+  "name": "Cyber Link",
+  "description": "Dezentrales Offline-Bluetooth-Kommunikationsnetzwerk & Offline-Vektorkarten (CYBER LINK V5.0 / CYBER MAP V1.0)",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

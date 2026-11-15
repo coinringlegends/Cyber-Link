@@ -1,0 +1,10 @@
+<resources>
+    <string name="app_name">Cyber Link</string>
+    <string name="osm_attribution">© OpenStreetMap contributors • Open Database License (ODbL)</string>
+    <string name="mapsforge_attribution">Kartenengine: Mapsforge (LGPLv3)</string>
+    <string name="notif_channel_transport">Bluetooth-Transport</string>
+    <string name="notif_channel_location">Standortfreigabe</string>
+    <string name="notif_transport_title">CYBER LINK aktiv</string>
+    <string name="notif_location_title">Standortfreigabe aktiv</string>
+    <string name="action_stop">Stoppen</string>
+</resources>
