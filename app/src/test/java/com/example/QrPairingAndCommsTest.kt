@@ -162,8 +162,7 @@ class QrPairingAndCommsTest {
         val handshakeRes = sessionA.runClientChallengeHandshake(
             localEncryption = encA,
             peerExpectedPublicKeyBytes = EncryptionManager.decodeBase64(parsedB.pubB64),
-            sendBytesChunked = { payload, _ ->
-                val isEnc = sessionA.cipherSession != null
+            sendBytesChunked = { payload, _, isEnc ->
                 val chunks = CyberLinkProtocol.chunkPayload(7, payload, sessionA.effectiveMtu, encrypted = isEnc)
                 for (c in chunks) {
                     val re = sessionB.reassembler.feed(c) ?: continue

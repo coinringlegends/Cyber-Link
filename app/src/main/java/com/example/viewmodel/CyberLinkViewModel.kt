@@ -14,6 +14,7 @@ import com.example.bluetooth.IncomingPairingPrompt
 import com.example.bluetooth.PeerManager
 import com.example.bluetooth.PeerTransportSession
 import com.example.bluetooth.QrPairingProgress
+import com.example.bluetooth.RfcommDiagnostics
 import com.example.bluetooth.TransportState
 import com.example.crypto.EncryptionManager
 import com.example.data.db.ContactEntity
@@ -79,6 +80,7 @@ class CyberLinkViewModel(application: Application) : AndroidViewModel(applicatio
     val isScanning: StateFlow<Boolean> = container.bluetoothManager.isScanning
     val isAdvertising: StateFlow<Boolean> = container.bluetoothManager.isAdvertising
     val bleDiagnostics: StateFlow<BleDiagnostics> = container.bluetoothManager.bleDiagnostics
+    val rfcommDiagnostics: StateFlow<RfcommDiagnostics> = container.bluetoothManager.rfcommDiagnostics
     val qrPairingProgress: StateFlow<QrPairingProgress> = container.bluetoothManager.qrPairingProgress
     val incomingPairingPrompt: StateFlow<IncomingPairingPrompt?> = container.bluetoothManager.incomingPairingPrompt
 
@@ -206,8 +208,33 @@ class CyberLinkViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch(Dispatchers.IO) {
             val res = container.bluetoothManager.upgradeToRfcomm(peerNodeId)
             _statusBanner.value = res.fold(
-                onSuccess = { "RFCOMM-Datenkanal zu $peerNodeId aktiv" },
+                onSuccess = { "RFCOMM bidirektional & AES-GCM verifiziert für $peerNodeId" },
                 onFailure = { it.message ?: "RFCOMM-Aufbau fehlgeschlagen" },
+            )
+        }
+    }
+
+    fun startRfcommServer() {
+        container.bluetoothManager.startPeripheralServices(displayName.value)
+    }
+
+    fun runRfcommBidirectionalTest(peerNodeId: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val session = container.bluetoothManager.getSession(peerNodeId)
+            val boundAddr = container.bluetoothManager.rfcommTransport.getBoundAddress(peerNodeId)
+                ?: session?.effectiveRfcommAddress()
+            val res = if (boundAddr != null && container.bluetoothManager.rfcommTransport.isSocketConnected(boundAddr, peerNodeId)) {
+                container.bluetoothManager.rfcommTransport.runBidirectionalTestOnOpenSocket(
+                    address = boundAddr,
+                    peerNodeId = peerNodeId,
+                    cipher = session?.cipherSession,
+                ).map { }
+            } else {
+                container.bluetoothManager.upgradeToRfcomm(peerNodeId)
+            }
+            _statusBanner.value = res.fold(
+                onSuccess = { "RFCOMM bidirektionaler Test für $peerNodeId bestanden" },
+                onFailure = { it.message ?: "RFCOMM-Test fehlgeschlagen" },
             )
         }
     }

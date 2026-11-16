@@ -49,10 +49,10 @@
 
 ## GitHub Pages & automatischen Build einrichten
 
-### Option A: Sofort über `/docs` (ohne Build-Minuten)
+### Option A: Sofort über `/(root)` oder `/docs` (ohne Build-Minuten)
 1. Repository auf GitHub pushen.
 2. Auf GitHub **Settings → Pages** öffnen.
-3. Unter **Build and deployment** → Source: **Deploy from a branch** → Branch **`main`**, Ordner **`/docs`** auswählen und speichern.
+3. Unter **Build and deployment** → Source: **Deploy from a branch** → Branch **`main`**, Ordner **`/docs`** (oder **`/(root)`**, da sowohl `docs/index.html` als auch `index.html` im Hauptverzeichnis liegen) auswählen und speichern.
 4. Nach ca. 1 Minute ist die Webseite inkl. direktem APK-Download online.
 
 ### Option B: Automatischer APK-Neubau per GitHub Actions
@@ -64,6 +64,6 @@ Der beiliegende Workflow [`.github/workflows/github-pages-apk.yml`](.github/work
 
 - **Application ID:** `com.aistudio.cyberlink.kxmpzq`
 - **Min / Target SDK:** Android 7.0 (API 24) / API 36
-- **APK SHA-256:** `f32cb06e5335189e0c1eeb22b4494439f21f22ed1310c4a6ebbf336d6fbfb3d7`
-- **Software- & Robolectric-Tests:** 36 / 36 bestanden (`gradle :app:testDebugUnitTest`)
+- **APK SHA-256:** `6c3df7f77e5dd55fd0fe4d35314bd21a842ef95c51909dceeb83c2030d78ff34`
+- **Software- & Robolectric-Tests:** 42 / 42 bestanden (`gradle :app:testDebugUnitTest`)
 - **Physischer Zwei-Smartphone-Hardwaretest:** Noch offen (`NICHT GETESTET` in der Cloud-Build-Umgebung)

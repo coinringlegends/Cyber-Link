@@ -48,7 +48,7 @@ jobs:
           SHA=$(sha256sum docs/downloads/cyber-link-app.apk | awk '{print $1}')
           BYTES=$(wc -c < docs/downloads/cyber-link-app.apk | tr -d ' ')
           echo "Built APK: ${BYTES} bytes, SHA-256: ${SHA}"
-          sed -i -E "s|<code class=\"sha\" id=\"apkSha\">[a-f0-9]+</code>|<code class=\"sha\" id=\"apkSha\">${SHA}</code>|" docs/index.html
+          sed -i -E "s|<code class=\"sha\" id=\"apkSha\">[a-f0-9]+</code>|<code class=\"sha\" id=\"apkSha\">${SHA}</code>|" docs/index.html index.html
 
       - name: Setup Pages
         uses: actions/configure-pages@v5

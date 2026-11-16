@@ -45,13 +45,21 @@ class GattOperationQueue(
         opName: String,
         timeoutMs: Long = defaultTimeoutMs,
         initiate: () -> Boolean,
+    ): GattOpResult = enqueueStatus(opName, timeoutMs) {
+        if (initiate()) 0 else -10
+    }
+
+    suspend fun enqueueStatus(
+        opName: String,
+        timeoutMs: Long = defaultTimeoutMs,
+        initiateWithStatus: () -> Int,
     ): GattOpResult = mutex.withLock {
         val deferred = CompletableDeferred<GattOpResult>()
         activeOpName = opName
         activeDeferred = deferred
 
-        val started = try {
-            initiate()
+        val initStatus = try {
+            initiateWithStatus()
         } catch (t: Throwable) {
             activeDeferred = null
             activeOpName = null
@@ -61,11 +69,12 @@ class GattOperationQueue(
             )
         }
 
-        if (!started) {
+        if (initStatus != 0) {
             activeDeferred = null
             activeOpName = null
             return@withLock GattOpResult.Failed(
-                reason = "Android GATT rejected $opName (returned false / queue busy)",
+                reason = "Android GATT rejected $opName: ${describeGattStatus(initStatus)}",
+                statusCode = initStatus,
                 callbackName = opName,
             )
         }

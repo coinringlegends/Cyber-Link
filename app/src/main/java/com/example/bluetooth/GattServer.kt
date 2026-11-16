@@ -27,13 +27,15 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /**
  * Android BLE GATT Server + Connectable Advertiser.
- * Hosts CYBER LINK Service (IDENTITY read, RX write/write_no_response, TX notify+CCCD 0x2902).
- * Properly handles API 33+ notifyCharacteristicChanged vs legacy setValue+notifyCharacteristicChanged,
- * validates incoming ChallengeStart, and transmits encrypted VERIFY_ACK responses sequentially.
+ * Hosts CYBER LINK Service (IDENTITY read, RX write/write_no_response, TX notify/indicate + CCCD 0x2902).
+ * Fixes session resolution across onMtuChanged / onDescriptorWriteRequest / onCharacteristicWriteRequest /
+ * onNotificationSent via resolvedNodeIdByAddress so ChallengeResponse chunks and VERIFY_ACK always complete
+ * on the exact same PeerTransportSession queue.
  */
 @SuppressLint("MissingPermission")
 class GattServer(
@@ -51,8 +53,12 @@ class GattServer(
     private var advertiser: BluetoothLeAdvertiser? = null
     private var advertiseCallback: AdvertiseCallback? = null
     private var txCharacteristic: BluetoothGattCharacteristic? = null
+
     private val connectedDevices = ConcurrentHashMap<String, BluetoothDevice>()
     private val cccdEnabledByAddress = ConcurrentHashMap<String, Boolean>()
+    private val txIndicationByAddress = ConcurrentHashMap<String, Boolean>()
+    private val mtuByAddress = ConcurrentHashMap<String, Int>()
+    private val resolvedNodeIdByAddress = ConcurrentHashMap<String, String>()
     private val serverChannelId = AtomicInteger(1000)
     private var lastLocalName: String = "CYBER-LINK"
 
@@ -82,6 +88,24 @@ class GattServer(
         } else {
             ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH) == PackageManager.PERMISSION_GRANTED
         }
+    }
+
+    private fun resolveSession(device: BluetoothDevice, explicitNodeId: String? = null): PeerTransportSession {
+        if (explicitNodeId != null) {
+            resolvedNodeIdByAddress[device.address] = explicitNodeId
+        }
+        val knownId = explicitNodeId ?: resolvedNodeIdByAddress[device.address]
+        val session = getOrCreateSessionForDevice(device, knownId)
+        mtuByAddress[device.address]?.let { mtu ->
+            if ((session.negotiatedMtu ?: 0) < mtu) {
+                session.updateNegotiatedMtu(mtu)
+            }
+        }
+        if (cccdEnabledByAddress[device.address] == true && !session.cccdWriteSucceeded) {
+            session.cccdWriteSucceeded = true
+            session.cccdStatusCode = 0
+        }
+        return session
     }
 
     fun startServerAndAdvertising(adapter: BluetoothAdapter?, localDeviceName: String) {
@@ -118,8 +142,18 @@ class GattServer(
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
                     connectedDevices[device.address] = device
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                    val knownId = resolvedNodeIdByAddress.remove(device.address)
                     connectedDevices.remove(device.address)
                     cccdEnabledByAddress.remove(device.address)
+                    txIndicationByAddress.remove(device.address)
+                    mtuByAddress.remove(device.address)
+                    if (knownId != null) {
+                        val session = getOrCreateSessionForDevice(device, knownId)
+                        if (session.connectionRole == ConnectionRole.RESPONDER_SERVER && session.deviceAddress == device.address) {
+                            session.closeDisconnected("Initiator hat GATT-Server-Verbindung getrennt")
+                            onSessionUpdated(session)
+                        }
+                    }
                     // Restart advertising in case the Android BT stack halted peripheral advertising on disconnect
                     val adapter = androidBtManager.adapter
                     if (adapter != null && adapter.isEnabled) {
@@ -130,7 +164,8 @@ class GattServer(
             }
 
             override fun onMtuChanged(device: BluetoothDevice, mtu: Int) {
-                val session = getOrCreateSessionForDevice(device, null)
+                mtuByAddress[device.address] = mtu
+                val session = resolveSession(device)
                 session.updateNegotiatedMtu(mtu)
                 onSessionUpdated(session)
             }
@@ -148,7 +183,7 @@ class GattServer(
                         publicKeyB64 = localEncryption.publicKeyBase64,
                     )
                     val bytes = CyberLinkProtocol.encodeEnvelope(info)
-                    val slice = if (offset < bytes.size) bytes.copyOfRange(offset, bytes.size) else ByteArray(0)
+                    val slice = if (offset in 0..bytes.size) bytes.copyOfRange(offset, bytes.size) else ByteArray(0)
                     gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, slice)
                 } else {
                     gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_READ_NOT_PERMITTED, offset, null)
@@ -165,14 +200,25 @@ class GattServer(
                 value: ByteArray?,
             ) {
                 if (descriptor.uuid == CyberLinkUuids.CCCD_UUID) {
-                    val enabled = value != null && (
-                        value.contentEquals(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) ||
-                            value.contentEquals(BluetoothGattDescriptor.ENABLE_INDICATION_VALUE)
-                        )
+                    val isNotify = value != null && value.contentEquals(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+                    val isIndicate = value != null && value.contentEquals(BluetoothGattDescriptor.ENABLE_INDICATION_VALUE)
+                    val enabled = isNotify || isIndicate
                     cccdEnabledByAddress[device.address] = enabled
+                    txIndicationByAddress[device.address] = isIndicate
                     if (responseNeeded) {
                         gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
                     }
+                    val session = resolveSession(device)
+                    session.cccdWriteSucceeded = enabled
+                    session.cccdStatusCode = 0
+                    session.logStep(
+                        step = GattStep.CCCD_WRITE_COMPLETED,
+                        detail = if (enabled) "Client hat TX CCCD 0x2902 aktiviert (${if (isIndicate) "INDICATE" else "NOTIFY"})" else "Client hat TX CCCD 0x2902 deaktiviert",
+                        gattStatusCode = 0,
+                        callbackName = "onDescriptorWriteRequest",
+                        characteristicUuid = CyberLinkUuids.TX_CHAR_UUID.toString(),
+                    )
+                    onSessionUpdated(session)
                 } else if (responseNeeded) {
                     gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED, offset, null)
                 }
@@ -197,7 +243,7 @@ class GattServer(
                     gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
                 }
 
-                val session = getOrCreateSessionForDevice(device, null)
+                val session = resolveSession(device)
                 val reassembled = session.reassembler.feed(value) ?: return
                 scope.launch(Dispatchers.IO) {
                     handleServerReassembled(device, session, reassembled)
@@ -205,7 +251,7 @@ class GattServer(
             }
 
             override fun onNotificationSent(device: BluetoothDevice, status: Int) {
-                val session = getOrCreateSessionForDevice(device, null)
+                val session = resolveSession(device)
                 session.gattQueue.completeActive(
                     expectedOpPrefix = "notifyTx",
                     status = status,
@@ -259,36 +305,63 @@ class GattServer(
         if (!reassembled.encrypted) {
             val env = runCatching { CyberLinkProtocol.decodeEnvelope(reassembled.payload) }.getOrNull()
             if (env is CyberLinkProtocol.ProtocolEnvelope.ChallengeStart) {
-                val realSession = getOrCreateSessionForDevice(device, env.initiatorNodeId)
-                realSession.updateNegotiatedMtu(session.effectiveMtu)
+                val realSession = resolveSession(device, env.initiatorNodeId)
+                realSession.connectionRole = ConnectionRole.RESPONDER_SERVER
+
+                if (cccdEnabledByAddress[device.address] != true) {
+                    val errMsg = "TX CCCD 0x2902 für ${device.address} noch nicht aktiviert — ChallengeResponse kann nicht per Notify gesendet werden"
+                    realSession.fail(
+                        message = errMsg,
+                        callbackName = "onCharacteristicWriteRequest",
+                        characteristicUuid = CyberLinkUuids.TX_CHAR_UUID.toString(),
+                    )
+                    onSessionUpdated(realSession)
+                    return
+                }
+
                 val knownKey = lookupKnownPublicKey(env.initiatorNodeId)
                 val respResult = realSession.processIncomingChallengeStart(
                     localEncryption = localEncryption,
                     start = env,
                     peerExpectedPublicKeyBytes = knownKey,
                 )
+                onSessionUpdated(realSession)
+
                 respResult.onSuccess { respBytes ->
-                    sendChunkedNotification(device, realSession, respBytes, encrypted = false)
+                    sendChunkedNotification(
+                        device = device,
+                        session = realSession,
+                        payload = respBytes,
+                        encrypted = false,
+                        isChallengeResponse = true,
+                    )
                 }
                 onSessionUpdated(realSession)
                 return
             }
         }
 
-        session.onIncomingReassembledFrame(
+        val activeSession = resolveSession(device)
+        activeSession.onIncomingReassembledFrame(
             reassembled = reassembled,
             localEncryption = localEncryption,
             onResponderVerifyAckReady = { encryptedReply ->
                 scope.launch(Dispatchers.IO) {
-                    sendChunkedNotification(device, session, encryptedReply, encrypted = true)
-                    onSessionUpdated(session)
+                    sendChunkedNotification(
+                        device = device,
+                        session = activeSession,
+                        payload = encryptedReply,
+                        encrypted = true,
+                        isChallengeResponse = false,
+                    )
+                    onSessionUpdated(activeSession)
                 }
             },
             onApplicationEnvelope = { env ->
-                onApplicationEnvelope(session, env)
+                onApplicationEnvelope(activeSession, env)
             },
         )
-        onSessionUpdated(session)
+        onSessionUpdated(activeSession)
     }
 
     suspend fun sendEncryptedNotification(
@@ -301,7 +374,13 @@ class GattServer(
         val cipher = session.cipherSession
             ?: return Result.failure(IllegalStateException("Keine aktive Session-Verschlüsselung"))
         val encrypted = cipher.encrypt(CyberLinkProtocol.encodeEnvelope(envelope))
-        return sendChunkedNotification(device, session, encrypted, encrypted = true)
+        return sendChunkedNotification(
+            device = device,
+            session = session,
+            payload = encrypted,
+            encrypted = true,
+            isChallengeResponse = false,
+        )
     }
 
     private suspend fun sendChunkedNotification(
@@ -309,40 +388,89 @@ class GattServer(
         session: PeerTransportSession,
         payload: ByteArray,
         encrypted: Boolean,
+        isChallengeResponse: Boolean,
     ): Result<Unit> {
         val server = gattServer ?: return Result.failure(IllegalStateException("GATT-Server nicht gestartet"))
         val tx = txCharacteristic ?: return Result.failure(IllegalStateException("TX Characteristic fehlt"))
+        val confirm = txIndicationByAddress[device.address] == true
         val chunks = CyberLinkProtocol.chunkPayload(
             channelId = serverChannelId.getAndIncrement() and 0xFFFF,
             payload = payload,
             mtu = session.effectiveMtu,
             encrypted = encrypted,
         )
+        if (isChallengeResponse) {
+            session.logStep(
+                step = GattStep.RESPONSE_WRITE_STARTED,
+                detail = "Sende ChallengeResponse über TX (${payload.size} B, ${chunks.size} Chunks, MTU=${session.effectiveMtu}, confirm=$confirm)",
+                characteristicUuid = CyberLinkUuids.TX_CHAR_UUID.toString(),
+                writeType = if (confirm) "INDICATE" else "NOTIFY",
+            )
+            onSessionUpdated(session)
+        }
+
         for ((idx, chunk) in chunks.withIndex()) {
-            val res = session.gattQueue.enqueue("notifyTx_$idx", timeoutMs = 5_000L) {
-                notifyCompat(server, device, tx, chunk)
+            var res = session.gattQueue.enqueueStatus("notifyTx_$idx", timeoutMs = 5_000L) {
+                notifyCompatStatus(server, device, tx, confirm, chunk)
+            }
+            if (res is GattOperationQueue.GattOpResult.Failed && (res.statusCode == 201 || res.statusCode == -10)) {
+                // Transient BLE stack busy: allow a single short settle before failing
+                delay(60L)
+                res = session.gattQueue.enqueueStatus("notifyTx_${idx}_retry", timeoutMs = 5_000L) {
+                    notifyCompatStatus(server, device, tx, confirm, chunk)
+                }
             }
             if (res is GattOperationQueue.GattOpResult.Failed) {
+                val errMsg = "TX Notify Chunk $idx/${chunks.size} fehlgeschlagen: ${res.reason}"
+                if (isChallengeResponse) {
+                    session.fail(
+                        message = errMsg,
+                        statusCode = res.statusCode,
+                        callbackName = res.callbackName ?: "onNotificationSent",
+                        characteristicUuid = CyberLinkUuids.TX_CHAR_UUID.toString(),
+                    )
+                } else {
+                    session.logStep(
+                        step = GattStep.STEP_ERROR,
+                        detail = errMsg,
+                        gattStatusCode = res.statusCode,
+                        callbackName = res.callbackName ?: "onNotificationSent",
+                        characteristicUuid = CyberLinkUuids.TX_CHAR_UUID.toString(),
+                    )
+                }
+                onSessionUpdated(session)
                 return Result.failure(IllegalStateException(res.reason))
             }
+        }
+
+        if (isChallengeResponse) {
+            session.logStep(
+                step = GattStep.RESPONSE_WRITE_SUCCESS,
+                detail = "ChallengeResponse vollständig über TX übertragen (${chunks.size} Chunks)",
+                gattStatusCode = 0,
+                callbackName = "onNotificationSent",
+                characteristicUuid = CyberLinkUuids.TX_CHAR_UUID.toString(),
+                writeType = if (confirm) "INDICATE" else "NOTIFY",
+            )
+            onSessionUpdated(session)
         }
         return Result.success(Unit)
     }
 
-    private fun notifyCompat(
+    private fun notifyCompatStatus(
         server: BluetoothGattServer,
         device: BluetoothDevice,
         tx: BluetoothGattCharacteristic,
+        confirm: Boolean,
         data: ByteArray,
-    ): Boolean {
+    ): Int {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            val status = server.notifyCharacteristicChanged(device, tx, false, data)
-            status == BluetoothGatt.GATT_SUCCESS
+            server.notifyCharacteristicChanged(device, tx, confirm, data)
         } else {
             @Suppress("DEPRECATION")
             tx.value = data
             @Suppress("DEPRECATION")
-            server.notifyCharacteristicChanged(device, tx, false)
+            if (server.notifyCharacteristicChanged(device, tx, confirm)) 0 else -10
         }
     }
 
@@ -436,5 +564,8 @@ class GattServer(
         gattServer = null
         connectedDevices.clear()
         cccdEnabledByAddress.clear()
+        txIndicationByAddress.clear()
+        mtuByAddress.clear()
+        resolvedNodeIdByAddress.clear()
     }
 }

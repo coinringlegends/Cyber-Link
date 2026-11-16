@@ -419,7 +419,7 @@
         <div class="meta-strip">
           <div class="meta-item">
             <strong>App-Version</strong>
-            <span>CYBER LINK 5.0 (BLE-Fix V6.0 Build)</span>
+            <span>CYBER LINK 5.0 (RFCOMM-Fix V6.0 Build)</span>
           </div>
           <div class="meta-item">
             <strong>Paket-ID</strong>
@@ -431,14 +431,14 @@
           </div>
           <div class="meta-item">
             <strong>Dateigröße</strong>
-            <span>22,8 MB (23.931.239 Bytes)</span>
+            <span>23,0 MB (24.091.196 Bytes)</span>
           </div>
         </div>
 
         <div class="hash-row">
           <span>SHA-256 Prüfsumme:</span>
-          <code class="sha" id="apkSha">f32cb06e5335189e0c1eeb22b4494439f21f22ed1310c4a6ebbf336d6fbfb3d7</code>
-          <button class="copy-btn" type="button" onclick="copySha()">Kopieren</button>
+          <code class="sha" id="apkSha">6c3df7f77e5dd55fd0fe4d35314bd21a842ef95c51909dceeb83c2030d78ff34</code>
+          <button class="copy-btn" id="copyShaBtn" type="button" onclick="copySha()">Kopieren</button>
         </div>
       </section>
 
@@ -491,7 +491,7 @@
           <div class="card">
             <h3>3. Echte Bluetooth-Telefonie &amp; Videoanrufe</h3>
             <ul>
-              <li><strong>Audioanrufe:</strong> Echtzeit-Sprache über <code>AudioRecord</code> / <code>AudioTrack</code> (8 kHz 16-bit PCM) über verschlüsseltes Bluetooth Classic RFCOMM mit Annehmen, Ablehnen, Stummschaltung, Lautsprecher und Qualitätsmetriken (kbps &amp; Verlustrate).</li>
+              <li><strong>Audioanrufe:</strong> Echtzeit-Sprache über <code>AudioRecord</code> / <code>AudioTrack</code> (8 kHz 16-bit PCM) via verschlüsseltes Bluetooth Classic RFCOMM mit Annehmen, Ablehnen, Stummschaltung, Lautsprecher und Qualitätsmetriken (kbps &amp; Verlustrate).</li>
               <li><strong>Videoanrufe:</strong> Beidseitige CameraX-Übertragung mit adaptivem JPEG über RFCOMM, Front/Back-Kamerawechsel und Live-FPS/kbps-Anzeige.</li>
               <li><strong>Ehrliche Grenzen:</strong> Da BLE GATT zu langsam für Audio/Video ist, prüft die App RFCOMM aktiv und meldet ohne RFCOMM (bzw. bei Gruppenanrufen 3+) ehrlich <code>NICHT UNTERSTÜTZT</code>.</li>
             </ul>
@@ -617,8 +617,12 @@
   <script>
     function copySha() {
       const text = document.getElementById("apkSha").textContent.trim();
+      const btn = document.getElementById("copyShaBtn");
       if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(text);
+        navigator.clipboard.writeText(text).then(function () {
+          btn.textContent = "Kopiert";
+          setTimeout(function () { btn.textContent = "Kopieren"; }, 1800);
+        });
       }
     }
   </script>

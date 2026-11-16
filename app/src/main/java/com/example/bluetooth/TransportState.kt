@@ -23,6 +23,12 @@ enum class ActiveTransport(val labelDe: String) {
     DUAL_BLE_RFCOMM("BLE + RFCOMM"),
 }
 
+enum class ConnectionRole(val labelDe: String) {
+    NONE("UNBEKANNT"),
+    INITIATOR_CLIENT("INITIATOR (Client)"),
+    RESPONDER_SERVER("RESPONDER (Server)"),
+}
+
 enum class GattStep {
     GATT_CONNECTED,
     SERVICE_DISCOVERY_STARTED,
@@ -35,8 +41,16 @@ enum class GattStep {
     CCCD_WRITE_COMPLETED,
     CHALLENGE_CREATED,
     CHALLENGE_WRITE_STARTED,
+    CHALLENGE_WRITE_SUCCESS,
     CHALLENGE_WRITE_COMPLETED,
+    RESPONSE_WAITING,
     RESPONSE_RECEIVED,
+    RESPONSE_TIMEOUT,
+    CHALLENGE_RECEIVED,
+    CHALLENGE_VALIDATED,
+    RESPONSE_CREATED,
+    RESPONSE_WRITE_STARTED,
+    RESPONSE_WRITE_SUCCESS,
     CONFIRM_OK_RECEIVED,
     VERIFY_ACK_COMPLETED,
     STEP_ERROR,
@@ -47,6 +61,8 @@ data class GattLogEntry(
     val step: GattStep,
     val peerNodeId: String?,
     val sessionId: String?,
+    val challengeId: String? = null,
+    val role: ConnectionRole? = null,
     val connectionState: TransportState,
     val gattStatusCode: Int? = null,
     val callbackName: String? = null,
@@ -64,7 +80,9 @@ data class GattLogEntry(
         val mtuPart = currentMtu?.let { " mtu=$it" } ?: ""
         val peerPart = peerNodeId ?: "UNBEKANNT"
         val sessPart = sessionId?.take(8) ?: "-"
-        return "[$timeStr] ${step.name} | peer=$peerPart sess=$sessPart state=${connectionState.labelDe}$statusPart$cbPart$charPart$wtPart$mtuPart | $detail"
+        val chPart = challengeId?.take(8)?.let { " ch=$it" } ?: ""
+        val rolePart = role?.takeIf { it != ConnectionRole.NONE }?.let { " role=${it.name}" } ?: ""
+        return "[$timeStr] ${step.name} | peer=$peerPart sess=$sessPart$chPart$rolePart state=${connectionState.labelDe}$statusPart$cbPart$charPart$wtPart$mtuPart | $detail"
     }
 }
 
@@ -83,7 +101,10 @@ fun describeGattStatus(status: Int): String = when (status) {
     34 -> "GATT_CONN_LMP_TIMEOUT (34)"
     133 -> "GATT_ERROR (133)"
     147 -> "GATT_CONNECTION_TIMEOUT (147)"
+    200 -> "ERROR_PROFILE_SERVICE_NOT_BOUND (200)"
+    201 -> "ERROR_GATT_WRITE_REQUEST_BUSY (201)"
     257 -> "GATT_FAILURE (257)"
+    -10 -> "ANDROID_GATT_CALL_REJECTED_OR_BUSY (-10)"
     else -> "GATT_STATUS_$status"
 }
 
@@ -118,6 +139,52 @@ enum class DiagnosticComponentState(val labelDe: String) {
     FAILED("FAILED"),
 }
 
+enum class TransportChannelStage(val labelDe: String) {
+    BLE_SCAN("BLE_SCAN"),
+    BLE_GATT_CONNECT("BLE_GATT_CONNECT"),
+    BLE_GATT_READY("BLE_GATT_READY"),
+    RFCOMM_SERVER_READY("RFCOMM_SERVER_READY"),
+    RFCOMM_CLIENT_CONNECT("RFCOMM_CLIENT_CONNECT"),
+    RFCOMM_SOCKET_CONNECTED("RFCOMM_SOCKET_CONNECTED"),
+    RFCOMM_BIDIRECTIONAL_READY("RFCOMM_BIDIRECTIONAL_READY"),
+}
+
+enum class RfcommSocketState(val labelDe: String) {
+    IDLE("NICHT GESTARTET"),
+    STARTING("SERVER STARTET…"),
+    LISTENING("LAUSCHT (ACCEPT BEREIT)"),
+    PAIRING("PAIRING / BONDING…"),
+    CONNECTING("VERBINDET…"),
+    SOCKET_CONNECTED("SOCKET OFFEN (UNVERIFIZIERT)"),
+    TESTING_BIDIRECTIONAL("BIDIREKTIONALER TEST…"),
+    CONNECTED("VERBUNDEN (VERIFIZIERT)"),
+    FAILED("FEHLGESCHLAGEN"),
+}
+
+data class RfcommDiagnostics(
+    val ownNodeId: String = "",
+    val peerNodeId: String? = null,
+    val bluetoothDeviceName: String? = null,
+    val pairingStatus: String = "UNBEKANNT",
+    val serviceUuid: String = CyberLinkUuids.RFCOMM_SDP_UUID.toString(),
+    val serviceName: String = CyberLinkUuids.RFCOMM_SERVICE_NAME,
+    val serverSocketStatus: RfcommSocketState = RfcommSocketState.IDLE,
+    val serverErrorDetail: String? = null,
+    val clientSocketStatus: RfcommSocketState = RfcommSocketState.IDLE,
+    val connectError: String? = null,
+    val ioExceptionDetail: String? = null,
+    val actualConnectionStatus: String = "NICHT VERBUNDEN",
+    val bidirectionalTestStatus: String = "NICHT GETESTET",
+    val bytesSent: Long = 0L,
+    val bytesReceived: Long = 0L,
+    val activePeerAddress: String? = null,
+    val rfcommServerReady: Boolean = false,
+    val rfcommClientConnectOk: Boolean = false,
+    val rfcommSocketConnected: Boolean = false,
+    val rfcommBidirectionalReady: Boolean = false,
+    val trace: List<String> = emptyList(),
+)
+
 data class BleDiagnostics(
     val bluetoothEnabled: Boolean = false,
     val bleAdvertisingSupported: Boolean = false,
@@ -133,6 +200,13 @@ data class BleDiagnostics(
     val detectedNodeIds: List<String> = emptyList(),
     val gattStatusText: String = "BEREIT",
     val lastAndroidErrorCode: Int? = null,
+    val authRole: String = "—",
+    val activeSessionId: String? = null,
+    val activeChallengeId: String? = null,
+    val challengeTrace: List<String> = emptyList(),
+    val bleScanOk: Boolean = false,
+    val bleGattConnectOk: Boolean = false,
+    val bleGattReady: Boolean = false,
 )
 
 /**

@@ -163,6 +163,14 @@ object CyberLinkProtocol {
         }
 
         @Synchronized
+        fun pendingChunkProgress(): String? {
+            if (buffers.isEmpty()) return null
+            return buffers.entries.joinToString("; ") { (ch, buf) ->
+                "ch=$ch: ${buf.receivedCount}/${buf.totalChunks} Chunks (${buf.totalBytes} B)"
+            }
+        }
+
+        @Synchronized
         fun clearChannel(channelId: Int) {
             buffers.remove(channelId)
         }
@@ -187,6 +195,7 @@ object CyberLinkProtocol {
         @Serializable
         data class ChallengeStart(
             val sessionId: String,
+            val challengeId: String,
             val initiatorNodeId: String,
             val responderNodeId: String,
             val nonceAB64: String,
@@ -199,6 +208,7 @@ object CyberLinkProtocol {
         @Serializable
         data class ChallengeResponse(
             val sessionId: String,
+            val challengeId: String,
             val responderNodeId: String,
             val initiatorNodeId: String,
             val nonceAB64: String,
@@ -394,17 +404,19 @@ object CyberLinkProtocol {
 
     fun signatureTranscriptForStart(
         sessionId: String,
+        challengeId: String,
         initiatorNodeId: String,
         responderNodeId: String,
         nonceA: ByteArray,
         ephemeralPubA: ByteArray,
         timestampMs: Long,
     ): ByteArray = (
-        "START|$PROTOCOL_VERSION|$sessionId|$initiatorNodeId|$responderNodeId|$timestampMs|"
+        "START|$PROTOCOL_VERSION|$sessionId|$challengeId|$initiatorNodeId|$responderNodeId|$timestampMs|"
         ).toByteArray(Charsets.UTF_8) + nonceA + ephemeralPubA
 
     fun signatureTranscriptForResponse(
         sessionId: String,
+        challengeId: String,
         responderNodeId: String,
         initiatorNodeId: String,
         nonceA: ByteArray,
@@ -412,6 +424,6 @@ object CyberLinkProtocol {
         ephemeralPubB: ByteArray,
         timestampMs: Long,
     ): ByteArray = (
-        "RESP|$PROTOCOL_VERSION|$sessionId|$responderNodeId|$initiatorNodeId|$timestampMs|"
+        "RESP|$PROTOCOL_VERSION|$sessionId|$challengeId|$responderNodeId|$initiatorNodeId|$timestampMs|"
         ).toByteArray(Charsets.UTF_8) + nonceA + nonceB + ephemeralPubB
 }

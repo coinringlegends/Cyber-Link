@@ -63,8 +63,12 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.bluetooth.ActiveTransport
+import com.example.bluetooth.BleDiagnostics
 import com.example.bluetooth.DiagnosticComponentState
 import com.example.bluetooth.PeerManager
+import com.example.bluetooth.RfcommDiagnostics
+import com.example.bluetooth.RfcommSocketState
+import com.example.bluetooth.TransportChannelStage
 import com.example.bluetooth.TransportState
 import com.example.media.QrCodeHelper
 import com.example.ui.components.EmptyCyberState
@@ -95,6 +99,7 @@ fun BluetoothHubScreen(
     val isScanning by viewModel.isScanning.collectAsStateWithLifecycle()
     val isAdvertising by viewModel.isAdvertising.collectAsStateWithLifecycle()
     val bleDiagnostics by viewModel.bleDiagnostics.collectAsStateWithLifecycle()
+    val rfcommDiagnostics by viewModel.rfcommDiagnostics.collectAsStateWithLifecycle()
     val qrPairingProgress by viewModel.qrPairingProgress.collectAsStateWithLifecycle()
     val incomingPrompt by viewModel.incomingPairingPrompt.collectAsStateWithLifecycle()
     val currentQrPayload by viewModel.currentQrPayload.collectAsStateWithLifecycle()
@@ -370,8 +375,39 @@ fun BluetoothHubScreen(
                         style = MaterialTheme.typography.labelSmall,
                         color = if (bleDiagnostics.lastAndroidErrorCode != null) CyberCrimson else CyberTextSecondary,
                     )
+                    Text(
+                        text = "Auth-Rolle: ${bleDiagnostics.authRole} • Session: ${bleDiagnostics.activeSessionId?.take(8) ?: "—"} • Challenge: ${bleDiagnostics.activeChallengeId?.take(8) ?: "—"}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = CyberTextSecondary,
+                    )
+                    if (bleDiagnostics.challengeTrace.isNotEmpty()) {
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            text = "Challenge-Response Ablauf:",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = CyberCyan,
+                        )
+                        bleDiagnostics.challengeTrace.forEach { traceLine ->
+                            val isErr = traceLine.contains("TIMEOUT") || traceLine.contains("STEP_ERROR")
+                            Text(
+                                text = traceLine,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (isErr) CyberCrimson else CyberEmerald,
+                            )
+                        }
+                    }
                 }
             }
+        }
+
+        item {
+            RfcommAndStageDiagnosticsCard(
+                bleDiagnostics = bleDiagnostics,
+                rfcommDiagnostics = rfcommDiagnostics,
+                hasBluetoothPermissions = hasBluetoothPermissions,
+                onRequestBluetoothPermissions = onRequestBluetoothPermissions,
+                onStartRfcommServer = { viewModel.startRfcommServer() },
+            )
         }
 
         item {
@@ -463,6 +499,12 @@ fun BluetoothHubScreen(
                                 modifier = Modifier.testTag("rfcomm_upgrade_${session.peerNodeId}"),
                             ) {
                                 Text("RFCOMM")
+                            }
+                            OutlinedButton(
+                                onClick = { viewModel.runRfcommBidirectionalTest(session.peerNodeId) },
+                                modifier = Modifier.testTag("rfcomm_test_${session.peerNodeId}"),
+                            ) {
+                                Text("RFCOMM Test")
                             }
                             OutlinedButton(
                                 onClick = { viewModel.disconnectPeer(session.peerNodeId) },
@@ -773,3 +815,160 @@ private fun QrCameraScannerDialog(
         },
     )
 }
+
+@Composable
+private fun RfcommAndStageDiagnosticsCard(
+    bleDiagnostics: BleDiagnostics,
+    rfcommDiagnostics: RfcommDiagnostics,
+    hasBluetoothPermissions: Boolean,
+    onRequestBluetoothPermissions: () -> Unit,
+    onStartRfcommServer: () -> Unit,
+) {
+    val stageList = listOf(
+        TransportChannelStage.BLE_SCAN to bleDiagnostics.bleScanOk,
+        TransportChannelStage.BLE_GATT_CONNECT to bleDiagnostics.bleGattConnectOk,
+        TransportChannelStage.BLE_GATT_READY to bleDiagnostics.bleGattReady,
+        TransportChannelStage.RFCOMM_SERVER_READY to rfcommDiagnostics.rfcommServerReady,
+        TransportChannelStage.RFCOMM_CLIENT_CONNECT to rfcommDiagnostics.rfcommClientConnectOk,
+        TransportChannelStage.RFCOMM_SOCKET_CONNECTED to rfcommDiagnostics.rfcommSocketConnected,
+        TransportChannelStage.RFCOMM_BIDIRECTIONAL_READY to rfcommDiagnostics.rfcommBidirectionalReady,
+    )
+
+    Card(
+        colors = CardDefaults.cardColors(containerColor = CyberSurfaceElevated.copy(alpha = 0.88f)),
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("rfcomm_diagnostics_card"),
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = "RFCOMM-Diagnose (Bluetooth Classic)",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = CyberCyan,
+                )
+                if (!rfcommDiagnostics.rfcommServerReady) {
+                    OutlinedButton(
+                        onClick = {
+                            if (hasBluetoothPermissions) onStartRfcommServer() else onRequestBluetoothPermissions()
+                        },
+                        modifier = Modifier.testTag("rfcomm_server_start_btn"),
+                    ) {
+                        Text("Server starten", style = MaterialTheme.typography.labelSmall)
+                    }
+                }
+            }
+
+            Text(
+                text = "Transportstufen (BLE vs. RFCOMM strikt getrennt):",
+                style = MaterialTheme.typography.labelSmall,
+                color = CyberTextSecondary,
+            )
+            stageList.chunked(2).forEach { pair ->
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    pair.forEach { (stage, ok) ->
+                        Surface(
+                            color = if (ok) CyberEmerald.copy(alpha = 0.16f) else CyberSurfaceElevated,
+                            shape = RoundedCornerShape(6.dp),
+                            modifier = Modifier.weight(1f),
+                        ) {
+                            Text(
+                                text = "${if (ok) "OK" else "—"} ${stage.labelDe}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (ok) CyberEmerald else CyberTextSecondary,
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
+                            )
+                        }
+                    }
+                    if (pair.size == 1) Spacer(Modifier.weight(1f))
+                }
+            }
+
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = "Eigene Node-ID: ${rfcommDiagnostics.ownNodeId} • Peer-Node-ID: ${rfcommDiagnostics.peerNodeId ?: "—"}",
+                style = MaterialTheme.typography.labelSmall,
+            )
+            Text(
+                text = "Bluetooth-Gerätename: ${rfcommDiagnostics.bluetoothDeviceName ?: "—"} • Pairing: ${rfcommDiagnostics.pairingStatus}",
+                style = MaterialTheme.typography.labelSmall,
+                color = CyberTextSecondary,
+            )
+            Text(
+                text = "RFCOMM Service-UUID: ${rfcommDiagnostics.serviceUuid}",
+                style = MaterialTheme.typography.labelSmall,
+                color = CyberTextSecondary,
+            )
+            val srvColor = when (rfcommDiagnostics.serverSocketStatus) {
+                RfcommSocketState.LISTENING, RfcommSocketState.CONNECTED -> CyberEmerald
+                RfcommSocketState.FAILED -> CyberCrimson
+                else -> CyberAmber
+            }
+            Text(
+                text = "Server-Socket-Status: ${rfcommDiagnostics.serverSocketStatus.labelDe}" +
+                    (rfcommDiagnostics.serverErrorDetail?.let { " ($it)" } ?: ""),
+                style = MaterialTheme.typography.labelSmall,
+                color = srvColor,
+            )
+            val cliColor = when (rfcommDiagnostics.clientSocketStatus) {
+                RfcommSocketState.CONNECTED -> CyberEmerald
+                RfcommSocketState.FAILED -> CyberCrimson
+                RfcommSocketState.IDLE -> CyberTextSecondary
+                else -> CyberAmber
+            }
+            Text(
+                text = "Client-Socket-Status: ${rfcommDiagnostics.clientSocketStatus.labelDe}",
+                style = MaterialTheme.typography.labelSmall,
+                color = cliColor,
+            )
+            Text(
+                text = "Connect-Fehler: ${rfcommDiagnostics.connectError ?: "Keiner"}",
+                style = MaterialTheme.typography.labelSmall,
+                color = if (rfcommDiagnostics.connectError != null) CyberCrimson else CyberTextSecondary,
+            )
+            Text(
+                text = "IOException: ${rfcommDiagnostics.ioExceptionDetail ?: "Keine"}",
+                style = MaterialTheme.typography.labelSmall,
+                color = if (rfcommDiagnostics.ioExceptionDetail != null) CyberCrimson else CyberTextSecondary,
+            )
+            Text(
+                text = "Tatsächlicher Status: ${rfcommDiagnostics.actualConnectionStatus}",
+                style = MaterialTheme.typography.labelSmall,
+                color = if (rfcommDiagnostics.rfcommBidirectionalReady) CyberEmerald else CyberAmber,
+            )
+            Text(
+                text = "Bidirektionaler Test: ${rfcommDiagnostics.bidirectionalTestStatus}",
+                style = MaterialTheme.typography.labelSmall,
+                color = if (rfcommDiagnostics.rfcommBidirectionalReady) CyberEmerald else CyberTextSecondary,
+            )
+            Text(
+                text = "RFCOMM Bytes: ${rfcommDiagnostics.bytesSent} B gesendet • ${rfcommDiagnostics.bytesReceived} B empfangen",
+                style = MaterialTheme.typography.labelSmall,
+                color = CyberCyan,
+            )
+            if (rfcommDiagnostics.trace.isNotEmpty()) {
+                Spacer(Modifier.height(4.dp))
+                Text("RFCOMM-Protokoll:", style = MaterialTheme.typography.labelSmall, color = CyberCyan)
+                rfcommDiagnostics.trace.takeLast(8).forEach { line ->
+                    val isErr = line.contains("FAILED") || line.contains("ERROR") || line.contains("REJECTED")
+                    Text(
+                        text = line,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (isErr) CyberCrimson else CyberEmerald,
+                    )
+                }
+            }
+        }
+    }
+}
+

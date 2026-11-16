@@ -15,12 +15,14 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 
 /**
- * Android BLE GATT Client implementing V4.1 sequential queue, API 33+ vs legacy read/write calls,
- * explicit GATT status 147 (GATT_CONNECTION_TIMEOUT) handling, MTU 23 safety, and full step logging.
+ * Android BLE GATT Client implementing sequential operation queue, API 33+ vs legacy read/write calls,
+ * explicit GATT status handling, MTU 23 fallback safety, stale-Gatt callback isolation,
+ * proper encrypted flag propagation for VERIFY_ACK, and full Initiator step logging.
  */
 @SuppressLint("MissingPermission")
 class GattClient(
@@ -31,8 +33,17 @@ class GattClient(
     private val onApplicationEnvelope: (PeerTransportSession, CyberLinkProtocol.ProtocolEnvelope) -> Unit,
 ) {
     private val channelIdCounter = AtomicInteger(1)
+    private val attemptCounter = AtomicInteger(0)
+
+    @Volatile
+    private var currentAttemptId: Int = 0
+
+    @Volatile
     private var activeGatt: BluetoothGatt? = null
+
+    @Volatile
     private var activeSession: PeerTransportSession? = null
+
     private var connectDeferred: CompletableDeferred<Int>? = null
 
     fun connectAndHandshake(
@@ -40,8 +51,13 @@ class GattClient(
         session: PeerTransportSession,
         peerExpectedPublicKeyBytes: ByteArray?,
     ) {
+        val hadActiveGatt = activeGatt != null
         closeCurrent("Neue Verbindung initiiert")
+        val myAttemptId = attemptCounter.incrementAndGet()
+        currentAttemptId = myAttemptId
+
         session.resetForNewAttempt()
+        session.connectionRole = ConnectionRole.INITIATOR_CLIENT
         session.deviceAddress = device.address
         session.updateState(TransportState.CONNECTING)
         activeSession = session
@@ -52,6 +68,10 @@ class GattClient(
 
         val gattCallback = object : BluetoothGattCallback() {
             override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+                if (myAttemptId != currentAttemptId) {
+                    runCatching { gatt.close() }
+                    return
+                }
                 if (status != BluetoothGatt.GATT_SUCCESS) {
                     val statusDesc = describeGattStatus(status)
                     val msg = if (status == 147) {
@@ -87,6 +107,7 @@ class GattClient(
             }
 
             override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+                if (myAttemptId != currentAttemptId) return
                 val effective = if (status == BluetoothGatt.GATT_SUCCESS) mtu else CyberLinkProtocol.MIN_MTU
                 session.updateNegotiatedMtu(effective)
                 session.gattQueue.completeActive(
@@ -98,6 +119,7 @@ class GattClient(
             }
 
             override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+                if (myAttemptId != currentAttemptId) return
                 session.gattQueue.completeActive(
                     expectedOpPrefix = "discoverServices",
                     status = status,
@@ -111,6 +133,7 @@ class GattClient(
                 characteristic: BluetoothGattCharacteristic,
                 status: Int,
             ) {
+                if (myAttemptId != currentAttemptId) return
                 @Suppress("DEPRECATION")
                 val bytes = characteristic.value ?: ByteArray(0)
                 session.gattQueue.completeActive(
@@ -127,6 +150,7 @@ class GattClient(
                 value: ByteArray,
                 status: Int,
             ) {
+                if (myAttemptId != currentAttemptId) return
                 session.gattQueue.completeActive(
                     expectedOpPrefix = "readChar",
                     status = status,
@@ -140,6 +164,7 @@ class GattClient(
                 characteristic: BluetoothGattCharacteristic,
                 status: Int,
             ) {
+                if (myAttemptId != currentAttemptId) return
                 session.gattQueue.completeActive(
                     expectedOpPrefix = "writeChar",
                     status = status,
@@ -152,6 +177,7 @@ class GattClient(
                 descriptor: BluetoothGattDescriptor,
                 status: Int,
             ) {
+                if (myAttemptId != currentAttemptId) return
                 session.cccdStatusCode = status
                 session.cccdWriteSucceeded = (status == BluetoothGatt.GATT_SUCCESS)
                 session.gattQueue.completeActive(
@@ -166,9 +192,10 @@ class GattClient(
                 gatt: BluetoothGatt,
                 characteristic: BluetoothGattCharacteristic,
             ) {
+                if (myAttemptId != currentAttemptId) return
                 @Suppress("DEPRECATION")
                 val bytes = characteristic.value ?: return
-                handleIncomingTxNotification(gatt, session, bytes)
+                handleIncomingTxNotification(session, bytes)
             }
 
             override fun onCharacteristicChanged(
@@ -176,10 +203,12 @@ class GattClient(
                 characteristic: BluetoothGattCharacteristic,
                 value: ByteArray,
             ) {
-                handleIncomingTxNotification(gatt, session, value)
+                if (myAttemptId != currentAttemptId) return
+                handleIncomingTxNotification(session, value)
             }
 
             override fun onReadRemoteRssi(gatt: BluetoothGatt, rssi: Int, status: Int) {
+                if (myAttemptId != currentAttemptId) return
                 if (status == BluetoothGatt.GATT_SUCCESS) {
                     session.updateTelemetry(rssi = rssi)
                     onSessionUpdated(session)
@@ -187,21 +216,30 @@ class GattClient(
             }
         }
 
-        val gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
-        } else {
-            device.connectGatt(context, false, gattCallback)
-        }
-
-        if (gatt == null) {
-            session.fail("connectGatt gab null zurück", callbackName = "connectGatt")
-            onSessionUpdated(session)
-            return
-        }
-        activeGatt = gatt
-
         scope.launch(Dispatchers.IO) {
+            if (hadActiveGatt) {
+                delay(150L)
+            }
+            if (myAttemptId != currentAttemptId) return@launch
+
+            val gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+            } else {
+                device.connectGatt(context, false, gattCallback)
+            }
+
+            if (gatt == null) {
+                session.fail("connectGatt gab null zurück", callbackName = "connectGatt")
+                onSessionUpdated(session)
+                return@launch
+            }
+            activeGatt = gatt
+
             val connResult = withTimeoutOrNull(12_000L) { connDeferred.await() }
+            if (myAttemptId != currentAttemptId) {
+                closeGattInternal(gatt)
+                return@launch
+            }
             if (connResult == null) {
                 session.fail(
                     message = "GATT_CONNECTION_TIMEOUT (147): Timeout beim Warten auf onConnectionStateChange.",
@@ -335,18 +373,19 @@ class GattClient(
                 val localNotifyOk = gatt.setCharacteristicNotification(txChar, true)
                 session.notificationLocallyEnabled = localNotifyOk
                 if (localNotifyOk && cccd != null) {
-                    session.logStep(
-                        step = GattStep.CCCD_WRITE_STARTED,
-                        detail = "Schreibe CCCD 0x2902 ENABLE_NOTIFICATION_VALUE",
-                        characteristicUuid = txChar.uuid.toString(),
-                    )
-                    val enableValue = if ((txChar.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0) {
+                    val isNotify = (txChar.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0
+                    val enableValue = if (isNotify) {
                         BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                     } else {
                         BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
                     }
-                    val cccdRes = session.gattQueue.enqueue("writeDesc_cccd", timeoutMs = 5_000L) {
-                        writeDescriptorCompat(gatt, cccd, enableValue)
+                    session.logStep(
+                        step = GattStep.CCCD_WRITE_STARTED,
+                        detail = "Schreibe CCCD 0x2902 (${if (isNotify) "NOTIFY" else "INDICATION"})",
+                        characteristicUuid = txChar.uuid.toString(),
+                    )
+                    val cccdRes = session.gattQueue.enqueueStatus("writeDesc_cccd", timeoutMs = 5_000L) {
+                        writeDescriptorCompatStatus(gatt, cccd, enableValue)
                     }
                     if (cccdRes is GattOperationQueue.GattOpResult.Success) {
                         session.cccdWriteSucceeded = true
@@ -371,9 +410,10 @@ class GattClient(
             val result = session.runClientChallengeHandshake(
                 localEncryption = localEncryption,
                 peerExpectedPublicKeyBytes = peerExpectedPublicKeyBytes,
-                sendBytesChunked = { payload, writeType ->
-                    sendChunkedToRx(gatt, rxChar!!, session, payload, writeType, encrypted = false)
+                sendBytesChunked = { payload, writeType, encrypted ->
+                    sendChunkedToRx(gatt, rxChar!!, session, payload, writeType, encrypted = encrypted)
                 },
+                onStepLogged = { onSessionUpdated(session) },
             )
             if (result.isFailure) {
                 closeGattInternal(gatt)
@@ -425,8 +465,14 @@ class GattClient(
             encrypted = encrypted,
         )
         for ((index, chunk) in chunks.withIndex()) {
-            val res = session.gattQueue.enqueue("writeChar_rx_$index", timeoutMs = 5_000L) {
-                writeCharacteristicCompat(gatt, rxChar, chunk, writeType)
+            var res = session.gattQueue.enqueueStatus("writeChar_rx_$index", timeoutMs = 5_000L) {
+                writeCharacteristicCompatStatus(gatt, rxChar, chunk, writeType)
+            }
+            if (res is GattOperationQueue.GattOpResult.Failed && (res.statusCode == 201 || res.statusCode == -10)) {
+                delay(60L)
+                res = session.gattQueue.enqueueStatus("writeChar_rx_${index}_retry", timeoutMs = 5_000L) {
+                    writeCharacteristicCompatStatus(gatt, rxChar, chunk, writeType)
+                }
             }
             if (res is GattOperationQueue.GattOpResult.Failed) {
                 return res
@@ -436,7 +482,6 @@ class GattClient(
     }
 
     private fun handleIncomingTxNotification(
-        gatt: BluetoothGatt,
         session: PeerTransportSession,
         bytes: ByteArray,
     ) {
@@ -451,42 +496,41 @@ class GattClient(
         onSessionUpdated(session)
     }
 
-    private fun writeCharacteristicCompat(
+    private fun writeCharacteristicCompatStatus(
         gatt: BluetoothGatt,
         characteristic: BluetoothGattCharacteristic,
         data: ByteArray,
         writeType: Int,
-    ): Boolean {
+    ): Int {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            val code = gatt.writeCharacteristic(characteristic, data, writeType)
-            code == BluetoothGatt.GATT_SUCCESS
+            gatt.writeCharacteristic(characteristic, data, writeType)
         } else {
             @Suppress("DEPRECATION")
             characteristic.writeType = writeType
             @Suppress("DEPRECATION")
             characteristic.value = data
             @Suppress("DEPRECATION")
-            gatt.writeCharacteristic(characteristic)
+            if (gatt.writeCharacteristic(characteristic)) BluetoothGatt.GATT_SUCCESS else -10
         }
     }
 
-    private fun writeDescriptorCompat(
+    private fun writeDescriptorCompatStatus(
         gatt: BluetoothGatt,
         descriptor: BluetoothGattDescriptor,
         data: ByteArray,
-    ): Boolean {
+    ): Int {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            val code = gatt.writeDescriptor(descriptor, data)
-            code == BluetoothGatt.GATT_SUCCESS
+            gatt.writeDescriptor(descriptor, data)
         } else {
             @Suppress("DEPRECATION")
             descriptor.value = data
             @Suppress("DEPRECATION")
-            gatt.writeDescriptor(descriptor)
+            if (gatt.writeDescriptor(descriptor)) BluetoothGatt.GATT_SUCCESS else -10
         }
     }
 
     fun closeCurrent(reason: String) {
+        currentAttemptId = attemptCounter.incrementAndGet()
         activeGatt?.let { closeGattInternal(it) }
         activeSession?.closeDisconnected(reason)
         activeSession = null

@@ -2,6 +2,7 @@ package com.example
 
 import android.bluetooth.BluetoothGattCharacteristic
 import com.example.bluetooth.ActiveTransport
+import com.example.bluetooth.ConnectionRole
 import com.example.bluetooth.CyberLinkUuids
 import com.example.bluetooth.GattCapabilityValidator
 import com.example.bluetooth.GattOperationQueue
@@ -60,10 +61,11 @@ class GattHandshakeRepairTest {
         val result = sessionA.runClientChallengeHandshake(
             localEncryption = encA,
             peerExpectedPublicKeyBytes = encB.exportPublicKeyX509(),
-            sendBytesChunked = { payload, _ ->
+            sendBytesChunked = { payload, _, encrypted ->
                 // Verify Transport stays NONE before bidirectional VERIFY_ACK completes
-                val isVerify = sessionA.cipherSession != null
-                val chunks = CyberLinkProtocol.chunkPayload(1, payload, sessionA.effectiveMtu, encrypted = isVerify)
+                val expectedEncrypted = sessionA.cipherSession != null
+                assertEquals("GattClient encrypted flag must match handshake phase", expectedEncrypted, encrypted)
+                val chunks = CyberLinkProtocol.chunkPayload(1, payload, sessionA.effectiveMtu, encrypted = encrypted)
                 for (chunk in chunks) {
                     assertTrue(
                         "Chunk size ${chunk.size} exceeds ATT payload for MTU $mtu",
@@ -142,7 +144,7 @@ class GattHandshakeRepairTest {
         session.cccdWriteSucceeded = true
 
         var writeCalled = false
-        val res = session.runClientChallengeHandshake(encA, null, { _, _ ->
+        val res = session.runClientChallengeHandshake(encA, null, { _, _, _ ->
             writeCalled = true
             GattOperationQueue.GattOpResult.Success()
         })
@@ -159,7 +161,7 @@ class GattHandshakeRepairTest {
         val session = PeerTransportSession("CL-TESTTX", "00:11:22:33:44:55", "TestPeer")
         session.rxSpec = GattCapabilityValidator.CharacteristicSpec(CyberLinkUuids.RX_CHAR_UUID, BluetoothGattCharacteristic.PROPERTY_WRITE, false)
 
-        val res = session.runClientChallengeHandshake(encA, null, { _, _ -> GattOperationQueue.GattOpResult.Success() })
+        val res = session.runClientChallengeHandshake(encA, null, { _, _, _ -> GattOperationQueue.GattOpResult.Success() })
         assertTrue(res.isFailure)
         assertEquals(TransportState.ERROR, session.transportState)
         assertEquals(ActiveTransport.NONE, session.activeTransport)
@@ -174,7 +176,7 @@ class GattHandshakeRepairTest {
         session.cccdWriteSucceeded = false
         session.cccdStatusCode = 133
 
-        val res = session.runClientChallengeHandshake(encA, null, { _, _ -> GattOperationQueue.GattOpResult.Success() })
+        val res = session.runClientChallengeHandshake(encA, null, { _, _, _ -> GattOperationQueue.GattOpResult.Success() })
         assertTrue(res.isFailure)
         assertEquals(TransportState.ERROR, session.transportState)
         assertEquals(ActiveTransport.NONE, session.activeTransport)
@@ -230,7 +232,7 @@ class GattHandshakeRepairTest {
         val res = session.runClientChallengeHandshake(
             localEncryption = encA,
             peerExpectedPublicKeyBytes = null,
-            sendBytesChunked = { _, _ ->
+            sendBytesChunked = { _, _, _ ->
                 GattOperationQueue.GattOpResult.Failed(
                     reason = "GATT operation timeout after 5000ms in writeChar_rx_0",
                     callbackName = "writeChar_rx_0",
@@ -253,13 +255,17 @@ class GattHandshakeRepairTest {
         val res = session.runClientChallengeHandshake(
             localEncryption = encA,
             peerExpectedPublicKeyBytes = null,
-            sendBytesChunked = { _, _ -> GattOperationQueue.GattOpResult.Success() },
+            sendBytesChunked = { _, _, _ -> GattOperationQueue.GattOpResult.Success() },
             responseTimeoutMs = 150L,
+            maxChallengeRetries = 1,
         )
         assertTrue(res.isFailure)
         assertEquals(TransportState.ERROR, session.transportState)
         assertEquals(ActiveTransport.NONE, session.activeTransport)
         assertTrue(session.lastError!!.contains("Response-Timeout"))
+        assertTrue(session.logs.any { it.step == GattStep.CHALLENGE_WRITE_SUCCESS })
+        assertTrue(session.logs.any { it.step == GattStep.RESPONSE_WAITING })
+        assertTrue(session.logs.any { it.step == GattStep.RESPONSE_TIMEOUT })
     }
 
     @Test
@@ -297,5 +303,151 @@ class GattHandshakeRepairTest {
         assertEquals(enc.nodeId, parsed.nodeId)
         assertNotNull(parsed.cl2Code)
         assertTrue(PeerManager.isValidCl2Code(parsed.cl2Code))
+    }
+
+    @Test
+    fun `13 initiator and responder log all required challenge-response steps and preserve connectionRole`() {
+        val (sessionA, sessionB) = runSimulatedBidirectionalHandshake(517)
+
+        assertEquals(ConnectionRole.INITIATOR_CLIENT, sessionA.connectionRole)
+        assertEquals(ConnectionRole.RESPONDER_SERVER, sessionB.connectionRole)
+        assertNotNull(sessionA.activeChallengeId)
+        assertEquals(sessionA.activeChallengeId, sessionB.activeChallengeId)
+        assertEquals(sessionA.sessionId, sessionB.sessionId)
+
+        val stepsA = sessionA.logs.map { it.step }
+        assertTrue(stepsA.contains(GattStep.CHALLENGE_CREATED))
+        assertTrue(stepsA.contains(GattStep.CHALLENGE_WRITE_STARTED))
+        assertTrue(stepsA.contains(GattStep.CHALLENGE_WRITE_SUCCESS))
+        assertTrue(stepsA.contains(GattStep.RESPONSE_WAITING))
+        assertTrue(stepsA.contains(GattStep.RESPONSE_RECEIVED))
+        assertTrue(stepsA.contains(GattStep.VERIFY_ACK_COMPLETED))
+
+        val stepsB = sessionB.logs.map { it.step }
+        assertTrue(stepsB.contains(GattStep.CHALLENGE_RECEIVED))
+        assertTrue(stepsB.contains(GattStep.CHALLENGE_VALIDATED))
+        assertTrue(stepsB.contains(GattStep.RESPONSE_CREATED))
+        assertTrue(stepsB.contains(GattStep.VERIFY_ACK_COMPLETED))
+    }
+
+    @Test
+    fun `14 multi-chunk ChallengeResponse queue completes on promoted session without PEER split`() = runBlocking {
+        val encA = EncryptionManager()
+        val encB = EncryptionManager()
+
+        // Temp server session created on initial connection before ChallengeStart arrives
+        val tempPeerSession = PeerTransportSession("PEER-112233445566", "11:22:33:44:55:66", "ClientA")
+        tempPeerSession.updateNegotiatedMtu(247)
+        tempPeerSession.cccdWriteSucceeded = true
+        tempPeerSession.cccdStatusCode = 0
+
+        // Promoted real session when ChallengeStart reveals encA.nodeId
+        val realServerSession = PeerTransportSession(encA.nodeId, "11:22:33:44:55:66", "ClientA")
+        realServerSession.adoptPendingServerStateFrom(tempPeerSession)
+        assertEquals(247, realServerSession.negotiatedMtu)
+        assertTrue(realServerSession.cccdWriteSucceeded)
+
+        val sessionA = PeerTransportSession(encB.nodeId, "AA:BB:CC:DD:EE:99", "ServerB")
+        sessionA.updateNegotiatedMtu(247)
+        readySpecs(sessionA)
+
+        // Simulate multi-chunk notify queue on realServerSession where onNotificationSent resolves to realServerSession
+        val handshake = sessionA.runClientChallengeHandshake(
+            localEncryption = encA,
+            peerExpectedPublicKeyBytes = encB.exportPublicKeyX509(),
+            sendBytesChunked = { payload, _, encrypted ->
+                val chunks = CyberLinkProtocol.chunkPayload(11, payload, sessionA.effectiveMtu, encrypted = encrypted)
+                for (c in chunks) {
+                    val re = realServerSession.reassembler.feed(c) ?: continue
+                    if (!re.encrypted) {
+                        val env = CyberLinkProtocol.decodeEnvelope(re.payload) as CyberLinkProtocol.ProtocolEnvelope.ChallengeStart
+                        val respBytes = realServerSession.processIncomingChallengeStart(
+                            encB,
+                            env,
+                            encA.exportPublicKeyX509(),
+                        ).getOrThrow()
+                        val respChunks = CyberLinkProtocol.chunkPayload(12, respBytes, realServerSession.effectiveMtu, encrypted = false)
+                        assertTrue("ChallengeResponse should span multiple chunks at MTU 247", respChunks.size >= 2)
+                        for ((idx, rc) in respChunks.withIndex()) {
+                            val notifyJob = launch {
+                                delay(10)
+                                realServerSession.gattQueue.completeActive("notifyTx", 0, callbackName = "onNotificationSent")
+                            }
+                            val res = realServerSession.gattQueue.enqueueStatus("notifyTx_$idx") {
+                                sessionA.reassembler.feed(rc)?.let { sessionA.onIncomingReassembledFrame(it, encA) }
+                                0
+                            }
+                            notifyJob.join()
+                            assertTrue("Chunk $idx notify must complete on realServerSession", res is GattOperationQueue.GattOpResult.Success)
+                        }
+                    } else {
+                        realServerSession.onIncomingReassembledFrame(
+                            reassembled = re,
+                            localEncryption = encB,
+                            onResponderVerifyAckReady = { reply ->
+                                for (rc in CyberLinkProtocol.chunkPayload(13, reply, realServerSession.effectiveMtu, encrypted = true)) {
+                                    sessionA.reassembler.feed(rc)?.let { sessionA.onIncomingReassembledFrame(it, encA) }
+                                }
+                            },
+                        )
+                    }
+                }
+                GattOperationQueue.GattOpResult.Success()
+            },
+        )
+        assertTrue("Promoted session handshake must succeed: ${handshake.exceptionOrNull()?.message}", handshake.isSuccess)
+        assertEquals(TransportState.CONNECTED, sessionA.transportState)
+        assertEquals(TransportState.CONNECTED, realServerSession.transportState)
+    }
+
+    @Test
+    fun `15 stale ChallengeResponse wrong challengeId is ignored and replayed ChallengeStart rejected`() = runBlocking {
+        val encA = EncryptionManager()
+        val encB = EncryptionManager()
+        val sessionB = PeerTransportSession(encA.nodeId, "AA:BB:CC:DD:EE:01", "A")
+        val ephA = encA.generateEphemeralKeyPair()
+        val nonceA = encA.generateNonce(16)
+        val ts = System.currentTimeMillis()
+        val chId = "ch-unique-replay-test"
+        val start = CyberLinkProtocol.ProtocolEnvelope.ChallengeStart(
+            sessionId = "sess-1",
+            challengeId = chId,
+            initiatorNodeId = encA.nodeId,
+            responderNodeId = encB.nodeId,
+            nonceAB64 = EncryptionManager.encodeBase64(nonceA),
+            ephemeralPubAB64 = EncryptionManager.encodeBase64(ephA.public.encoded),
+            identityPubAB64 = encA.publicKeyBase64,
+            timestampMs = ts,
+            signatureAB64 = EncryptionManager.encodeBase64(
+                encA.signPayload(
+                    CyberLinkProtocol.signatureTranscriptForStart(
+                        "sess-1",
+                        chId,
+                        encA.nodeId,
+                        encB.nodeId,
+                        nonceA,
+                        ephA.public.encoded,
+                        ts,
+                    )
+                )
+            ),
+        )
+
+        val firstRes = sessionB.processIncomingChallengeStart(encB, start, encA.exportPublicKeyX509())
+        assertTrue(firstRes.isSuccess)
+
+        // Replay exact same challengeId must be rejected
+        val replayRes = sessionB.processIncomingChallengeStart(encB, start, encA.exportPublicKeyX509())
+        assertTrue("Replayed ChallengeStart with same challengeId must fail", replayRes.isFailure)
+
+        // Feeding a ChallengeResponse with wrong challengeId must not crash or complete wait
+        val sessionA = PeerTransportSession(encB.nodeId, "AA:BB:CC:DD:EE:02", "B")
+        val staleResp = CyberLinkProtocol.decodeEnvelope(firstRes.getOrThrow()) as CyberLinkProtocol.ProtocolEnvelope.ChallengeResponse
+        val staleBytes = CyberLinkProtocol.encodeEnvelope(staleResp.copy(challengeId = "ch-stale-old"))
+        sessionA.onIncomingReassembledFrame(
+            reassembled = CyberLinkProtocol.PacketReassembler.ReassembledMessage(1, false, staleBytes),
+            localEncryption = encA,
+        )
+        assertTrue(sessionA.logs.any { it.step == GattStep.STEP_ERROR && it.detail.contains("Veraltete ChallengeResponse") })
     }
 }

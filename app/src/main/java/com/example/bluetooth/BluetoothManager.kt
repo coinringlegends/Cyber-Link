@@ -200,10 +200,18 @@ class BluetoothManager(
         scope = scope,
         localEncryption = encryptionManager,
         getOrCreateSessionForDevice = { device, nodeIdHint ->
+            val tempPeerId = "PEER-${device.address.replace(":", "")}"
             val resolvedId = nodeIdHint
                 ?: discoveredMap[device.address]?.nodeId
-                ?: "PEER-${device.address.replace(":", "")}"
-            getOrCreateSession(resolvedId, device.address, device.name)
+                ?: tempPeerId
+            val targetSession = getOrCreateSession(resolvedId, device.address, device.name)
+            if (resolvedId != tempPeerId) {
+                val staleTemp = sessionMap.remove(tempPeerId)
+                if (staleTemp != null && staleTemp !== targetSession) {
+                    targetSession.adoptPendingServerStateFrom(staleTemp)
+                }
+            }
+            targetSession
         },
         lookupKnownPublicKey = lookupContactPublicKey,
         onSessionUpdated = { session -> publishSession(session) },
@@ -229,10 +237,17 @@ class BluetoothManager(
         },
     )
 
-    val rfcommTransport = RfcommTransport(
+    val rfcommTransport: RfcommTransport = RfcommTransport(
+        context = context,
         scope = scope,
-        onFrameReceived = { addr, frameType, encryptedPayload ->
-            val session = sessionMap.values.firstOrNull { it.deviceAddress == addr } ?: return@RfcommTransport
+        localNodeId = encryptionManager.nodeId,
+        lookupSessionCipher = { peerId -> sessionMap[peerId]?.cipherSession },
+        stopDiscoveryBeforeConnect = { stopDiscovery() },
+        onFrameReceived = { addr, boundPeerId, frameType, encryptedPayload ->
+            val resolvedPeerId = boundPeerId ?: rfcommTransport.getBoundPeerNodeId(addr)
+            val session = resolvedPeerId?.let { sessionMap[it] }
+                ?: sessionMap.values.firstOrNull { it.classicAddress == addr || it.deviceAddress == addr }
+                ?: return@RfcommTransport
             val cipher = session.cipherSession ?: return@RfcommTransport
             runCatching { cipher.decrypt(encryptedPayload) }.onSuccess { plain ->
                 if (frameType == RfcommTransport.FRAME_PROTOCOL_ENVELOPE) {
@@ -244,13 +259,25 @@ class BluetoothManager(
                 }
             }
         },
-        onRfcommStateChanged = { addr, connected, _ ->
-            val session = sessionMap.values.firstOrNull { it.deviceAddress == addr }
-            if (session != null && connected && session.transportState == TransportState.CONNECTED) {
+        onRfcommStateChanged = { addr, boundPeerId, connected, bidirectionalReady, err ->
+            val resolvedPeerId = boundPeerId ?: rfcommTransport.getBoundPeerNodeId(addr)
+            val session = resolvedPeerId?.let { sessionMap[it] }
+                ?: sessionMap.values.firstOrNull { it.classicAddress == addr || it.deviceAddress == addr }
+            if (session != null) {
+                if (connected) {
+                    session.classicAddress = addr
+                }
+                session.rfcommBidirectionalReady = bidirectionalReady
+                session.rfcommLastError = err
+                val diag = rfcommTransport.diagnostics.value
+                session.rfcommBytesSent = diag.bytesSent
+                session.rfcommBytesReceived = diag.bytesReceived
                 publishSession(session)
             }
         },
     )
+
+    val rfcommDiagnostics: StateFlow<RfcommDiagnostics> = rfcommTransport.diagnostics
 
     fun isBluetoothEnabled(): Boolean = adapter?.isEnabled == true
 
@@ -545,13 +572,31 @@ class BluetoothManager(
             gattClient.connectAndHandshake(device, session, expectedKey)
 
             // Observe GATT handshake progress toward CONNECTED (steps 8..11)
-            val gattDeadline = System.currentTimeMillis() + 20_000L
+            val gattDeadline = System.currentTimeMillis() + 30_000L
             while (System.currentTimeMillis() < gattDeadline) {
+                val latestChallengeStep = session.logs.lastOrNull {
+                    it.step == GattStep.CHALLENGE_CREATED ||
+                        it.step == GattStep.CHALLENGE_WRITE_STARTED ||
+                        it.step == GattStep.CHALLENGE_WRITE_SUCCESS ||
+                        it.step == GattStep.RESPONSE_WAITING ||
+                        it.step == GattStep.RESPONSE_RECEIVED ||
+                        it.step == GattStep.RESPONSE_TIMEOUT
+                }
                 when (session.transportState) {
                     TransportState.SERVICE_DISCOVERY ->
                         updateProgress(9, "9/12 Notifications & RX/TX aktivieren (CCCD 0x2902)…")
-                    TransportState.AUTHENTICATING ->
-                        updateProgress(7, "7/12 ECDH-Schlüsselaustausch & Challenge-Signatur…")
+                    TransportState.AUTHENTICATING -> {
+                        val subLabel = when (latestChallengeStep?.step) {
+                            GattStep.CHALLENGE_CREATED -> "7/12 Challenge erzeugt (ch=${session.activeChallengeId?.take(8) ?: "—"})…"
+                            GattStep.CHALLENGE_WRITE_STARTED -> "8/12 Challenge an RX senden…"
+                            GattStep.CHALLENGE_WRITE_SUCCESS -> "8/12 Challenge gesendet • aktiviere Antwortkanal…"
+                            GattStep.RESPONSE_WAITING -> "8/12 Warte auf ChallengeResponse von ${payload.nodeId}…"
+                            GattStep.RESPONSE_RECEIVED -> "8/12 ChallengeResponse empfangen & Signatur prüfen…"
+                            GattStep.RESPONSE_TIMEOUT -> "8/12 Response-Timeout • erneuter Versuch / Diagnose…"
+                            else -> "7/12 ECDH-Schlüsselaustausch & Challenge-Signatur…"
+                        }
+                        updateProgress(8, subLabel)
+                    }
                     TransportState.DATA_CHANNEL_READY ->
                         updateProgress(10, "10/12 Verschlüsselte Testnachricht (VERIFY_ACK) senden…")
                     TransportState.CONNECTED -> break
@@ -565,11 +610,15 @@ class BluetoothManager(
                     }
                     else -> Unit
                 }
-                delay(180)
+                delay(150)
             }
 
             if (session.transportState != TransportState.CONNECTED || !session.verifyAckReceived) {
-                updateProgress(11, "11/12 ACK-Timeout", error = session.lastError ?: "Kein verschlüsseltes VERIFY_ACK erhalten.")
+                updateProgress(
+                    11,
+                    "11/12 Handshake fehlgeschlagen",
+                    error = session.lastError ?: "Kein verschlüsseltes VERIFY_ACK erhalten.",
+                )
                 disconnectPeer(payload.nodeId)
                 return@launch
             }
@@ -631,15 +680,15 @@ class BluetoothManager(
             )
         }
         gattServer.startServerAndAdvertising(adapter, localName)
-        if (hasConnectPermission() && isBluetoothEnabled()) {
-            rfcommTransport.startServer(adapter)
-        }
+        rfcommTransport.startServer(adapter)
         _isAdvertising.value = gattServer.isAdvertising
     }
 
     fun ensurePeripheralServicesActive(localName: String = "CYBER-${encryptionManager.nodeId.takeLast(6)}") {
         if (!gattServer.isAdvertising) {
             startPeripheralServices(localName)
+        } else if (!rfcommDiagnostics.value.rfcommServerReady) {
+            rfcommTransport.startServer(adapter)
         }
     }
 
@@ -744,6 +793,7 @@ class BluetoothManager(
                 scannerState = DiagnosticComponentState.RUNNING,
                 scanErrorCode = null,
                 scanErrorDetail = null,
+                bleScanOk = true,
             )
         }
 
@@ -885,18 +935,21 @@ class BluetoothManager(
         }
     }
 
-    fun upgradeToRfcomm(peerNodeId: String): Result<Unit> {
+    suspend fun upgradeToRfcomm(peerNodeId: String): Result<Unit> {
         val session = sessionMap[peerNodeId]
             ?: return Result.failure(IllegalStateException("Keine Session für $peerNodeId"))
-        if (session.transportState != TransportState.CONNECTED) {
-            return Result.failure(IllegalStateException("GATT-Authentifizierung noch nicht abgeschlossen"))
+        if (session.transportState != TransportState.CONNECTED || session.cipherSession == null) {
+            return Result.failure(IllegalStateException("GATT-Authentifizierung & Session-Schlüssel noch nicht abgeschlossen"))
         }
-        val addr = session.deviceAddress
-            ?: return Result.failure(IllegalStateException("Bluetooth-Adresse unbekannt"))
-        val device = deviceByAddress[addr]
-            ?: runCatching { adapter?.getRemoteDevice(addr) }.getOrNull()
-            ?: return Result.failure(IllegalStateException("Bluetooth-Gerät nicht erreichbar"))
-        return rfcommTransport.connectClient(device)
+        val res = rfcommTransport.connectAndVerifyPeer(
+            adapter = adapter,
+            peerNodeId = peerNodeId,
+            peerNameHint = session.deviceName,
+            classicAddressHint = session.classicAddress,
+            bleAddressHint = session.deviceAddress,
+            cipher = session.cipherSession,
+        )
+        return res.map { }
     }
 
     suspend fun sendEnvelope(
@@ -909,22 +962,37 @@ class BluetoothManager(
         if (session.transportState != TransportState.CONNECTED || session.activeTransport == ActiveTransport.NONE) {
             return Result.failure(IllegalStateException("Kein authentifizierter Transport aktiv (${session.transportState.labelDe})"))
         }
-        val addr = session.deviceAddress
-        if (preferRfcomm && addr != null && rfcommTransport.isConnected(addr)) {
+        val rfcommAddr = rfcommTransport.getBoundAddress(peerNodeId) ?: session.effectiveRfcommAddress()
+        if (preferRfcomm && rfcommAddr != null && rfcommTransport.isBidirectionallyReady(session.classicAddress, session.deviceAddress, peerNodeId)) {
             val bytes = CyberLinkProtocol.encodeEnvelope(envelope)
-            return rfcommTransport.sendFrame(addr, RfcommTransport.FRAME_PROTOCOL_ENVELOPE, bytes, session.cipherSession)
+            return rfcommTransport.sendFrame(rfcommAddr, RfcommTransport.FRAME_PROTOCOL_ENVELOPE, bytes, session.cipherSession)
         }
-        return if (session.isLocalInitiator(encryptionManager.nodeId)) {
-            gattClient.sendEncryptedEnvelope(session, envelope)
-        } else if (addr != null) {
-            gattServer.sendEncryptedNotification(addr, session, envelope)
-        } else {
-            Result.failure(IllegalStateException("Adresse für GATT-Server-Notify fehlt"))
+        val bleAddr = session.deviceAddress
+        return when (session.connectionRole) {
+            ConnectionRole.INITIATOR_CLIENT -> gattClient.sendEncryptedEnvelope(session, envelope)
+            ConnectionRole.RESPONDER_SERVER -> {
+                if (bleAddr != null) {
+                    gattServer.sendEncryptedNotification(bleAddr, session, envelope)
+                } else {
+                    Result.failure(IllegalStateException("Adresse für GATT-Server-Notify fehlt"))
+                }
+            }
+            ConnectionRole.NONE -> {
+                if (session.isLocalInitiator(encryptionManager.nodeId)) {
+                    gattClient.sendEncryptedEnvelope(session, envelope)
+                } else if (bleAddr != null) {
+                    gattServer.sendEncryptedNotification(bleAddr, session, envelope)
+                } else {
+                    Result.failure(IllegalStateException("Keine aktive GATT-Verbindungsrolle festgelegt"))
+                }
+            }
         }
     }
 
     fun disconnectPeer(peerNodeId: String) {
         val session = sessionMap[peerNodeId] ?: return
+        rfcommTransport.closePeer(peerNodeId, "Vom Benutzer getrennt")
+        session.classicAddress?.let { rfcommTransport.closePeer(it, "Vom Benutzer getrennt") }
         session.deviceAddress?.let { rfcommTransport.closePeer(it, "Vom Benutzer getrennt") }
         gattClient.closeCurrent("Vom Benutzer getrennt")
         session.closeDisconnected("Vom Benutzer getrennt")
@@ -953,10 +1021,14 @@ class BluetoothManager(
     fun getEffectiveTransportForPeer(peerNodeId: String): ActiveTransport {
         val session = sessionMap[peerNodeId] ?: return ActiveTransport.NONE
         if (session.transportState != TransportState.CONNECTED) return ActiveTransport.NONE
-        val rfcommActive = rfcommTransport.isConnected(session.deviceAddress)
+        val rfcommReady = rfcommTransport.isBidirectionallyReady(
+            classicAddress = session.classicAddress,
+            bleAddress = session.deviceAddress,
+            peerNodeId = peerNodeId,
+        )
         return when {
-            rfcommActive && session.activeTransport == ActiveTransport.BLE_GATT -> ActiveTransport.DUAL_BLE_RFCOMM
-            rfcommActive -> ActiveTransport.CLASSIC_RFCOMM
+            rfcommReady && session.activeTransport == ActiveTransport.BLE_GATT -> ActiveTransport.DUAL_BLE_RFCOMM
+            rfcommReady -> ActiveTransport.CLASSIC_RFCOMM
             else -> session.activeTransport
         }
     }
@@ -975,10 +1047,42 @@ class BluetoothManager(
         lastPublishedStates[session.peerNodeId] = session.transportState
         sessionMap[session.peerNodeId] = session
         _sessions.value = sessionMap.toMap()
+        val authTrace = session.logs
+            .filter {
+                it.step == GattStep.CCCD_WRITE_COMPLETED ||
+                    it.step == GattStep.CHALLENGE_CREATED ||
+                    it.step == GattStep.CHALLENGE_WRITE_STARTED ||
+                    it.step == GattStep.CHALLENGE_WRITE_SUCCESS ||
+                    it.step == GattStep.RESPONSE_WAITING ||
+                    it.step == GattStep.RESPONSE_RECEIVED ||
+                    it.step == GattStep.RESPONSE_TIMEOUT ||
+                    it.step == GattStep.CHALLENGE_RECEIVED ||
+                    it.step == GattStep.CHALLENGE_VALIDATED ||
+                    it.step == GattStep.RESPONSE_CREATED ||
+                    it.step == GattStep.RESPONSE_WRITE_STARTED ||
+                    it.step == GattStep.RESPONSE_WRITE_SUCCESS ||
+                    it.step == GattStep.VERIFY_ACK_COMPLETED ||
+                    it.step == GattStep.STEP_ERROR
+            }
+            .takeLast(12)
+            .map { it.formatLine() }
+        val gattConnected = session.rxSpec != null ||
+            session.transportState == TransportState.SERVICE_DISCOVERY ||
+            session.transportState == TransportState.AUTHENTICATING ||
+            session.transportState == TransportState.DATA_CHANNEL_READY ||
+            session.transportState == TransportState.CONNECTED
+        val gattReady = session.transportState == TransportState.CONNECTED &&
+            (session.activeTransport == ActiveTransport.BLE_GATT || session.activeTransport == ActiveTransport.DUAL_BLE_RFCOMM)
         updateDiagnostics {
             copy(
                 gattStatusText = "${session.peerNodeId}: ${session.transportState.labelDe}",
                 lastAndroidErrorCode = session.lastErrorStatusCode ?: lastAndroidErrorCode,
+                authRole = session.connectionRole.labelDe,
+                activeSessionId = session.sessionId,
+                activeChallengeId = session.activeChallengeId,
+                challengeTrace = authTrace,
+                bleGattConnectOk = gattConnected || bleGattConnectOk,
+                bleGattReady = gattReady,
             )
         }
         if (prevState != TransportState.CONNECTED && session.transportState == TransportState.CONNECTED) {

@@ -220,14 +220,16 @@ class AudioCallManager(
     @SuppressLint("MissingPermission")
     private fun startAudioStreams(peerNodeId: String, callId: String) {
         val session = bluetoothManager.getSession(peerNodeId)
-        val addr = session?.deviceAddress
-        if (session == null || addr == null || !bluetoothManager.rfcommTransport.isConnected(addr)) {
+        val addr = session?.let {
+            bluetoothManager.rfcommTransport.getBoundAddress(peerNodeId) ?: it.effectiveRfcommAddress()
+        }
+        if (session == null || addr == null || !bluetoothManager.rfcommTransport.isBidirectionallyReady(session.classicAddress, session.deviceAddress, peerNodeId)) {
             _state.value = AudioCallState(
                 callId = callId,
                 peerNodeId = peerNodeId,
                 status = CallStatus.UNSUPPORTED,
                 qualityLabel = "NICHT VERFÜGBAR",
-                statusDetail = "RFCOMM-Audiokanal nicht verbunden",
+                statusDetail = "RFCOMM-Audiokanal nicht bidirektional verifiziert",
             )
             return
         }
@@ -315,8 +317,11 @@ class AudioCallManager(
                 val read = recorder.read(buf, 0, buf.size)
                 if (read > 0 && !_state.value.isMuted) {
                     val frame = if (read == buf.size) buf else buf.copyOf(read)
+                    val sendAddr = bluetoothManager.rfcommTransport.getBoundAddress(peerNodeId)
+                        ?: session.effectiveRfcommAddress()
+                        ?: addr
                     val res = bluetoothManager.rfcommTransport.sendFrame(
-                        address = addr,
+                        address = sendAddr,
                         frameType = RfcommTransport.FRAME_AUDIO_PCM,
                         payload = frame,
                         cipher = session.cipherSession,

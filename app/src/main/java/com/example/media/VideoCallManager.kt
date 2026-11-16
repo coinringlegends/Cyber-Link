@@ -192,7 +192,12 @@ class VideoCallManager(
         if (current.status != VideoCallStatus.ACTIVE || !current.cameraEnabled) return
         val peerId = current.peerNodeId ?: return
         val session = bluetoothManager.getSession(peerId) ?: return
-        val addr = session.deviceAddress ?: return
+        val addr = bluetoothManager.rfcommTransport.getBoundAddress(peerId)
+            ?: session.effectiveRfcommAddress()
+            ?: return
+        if (!bluetoothManager.rfcommTransport.isBidirectionallyReady(session.classicAddress, session.deviceAddress, peerId)) {
+            return
+        }
 
         val now = System.currentTimeMillis()
         // Adaptive rate cap (~6 fps max over RFCOMM to avoid bufferbloat)
